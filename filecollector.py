@@ -1,5 +1,6 @@
 """
 文件内容收集器 - 递归读取文件夹下所有文件，输出为带路径和内容的TXT文件
+使用 pathspec 库完整支持 .gitignore 语法
 """
 
 import os
@@ -7,10 +8,17 @@ import sys
 import json
 import fnmatch
 from pathlib import Path
-from typing import List, Tuple, Set, Optional
+from typing import List, Tuple, Optional
 
 # 配置文件名称
 CONFIG_FILE = "collector_config.json"
+
+# 尝试导入 pathspec，如果未安装则提示
+try:
+    import pathspec
+    PATHSPEC_AVAILABLE = True
+except ImportError:
+    PATHSPEC_AVAILABLE = False
 
 
 def get_config_path() -> Path:
@@ -61,131 +69,66 @@ def load_config() -> Tuple[str, List[str], bool]:
         return "", [], False
 
 
-def parse_gitignore(base_dir: Path) -> List[str]:
+def load_gitignore_spec(base_dir: Path):
     """
-    解析 .gitignore 文件，返回模式列表
+    使用 pathspec 库解析 .gitignore 文件
 
     Args:
         base_dir: 目标文件夹路径
 
     Returns:
-        gitignore 中的模式列表
+        pathspec.PathSpec 对象，如果没有 .gitignore 或 pathspec 不可用则返回 None
     """
-    gitignore_path = base_dir / ".gitignore"
-    patterns = []
+    if not PATHSPEC_AVAILABLE:
+        print("警告: 未安装 pathspec 库，.gitignore 功能将使用简化实现（可能不完整）")
+        print("建议执行: pip install pathspec")
+        return None
 
+    gitignore_path = base_dir / ".gitignore"
     if not gitignore_path.exists():
-        return patterns
+        return None
 
     try:
         with open(gitignore_path, 'r', encoding='utf-8', errors='replace') as f:
-            for line in f:
-                line = line.strip()
-                # 跳过空行和注释
-                if not line or line.startswith('#'):
-                    continue
-
-                # 处理否定模式（以 ! 开头）
-                # 注意：为简化实现，这里暂不支持否定模式
-                if line.startswith('!'):
-                    continue
-
-                # 移除行尾的空格
-                line = line.rstrip()
-
-                # 处理以 \ 结尾的行（续行符）
-                while line.endswith('\\'):
-                    line = line[:-1].rstrip()
-                    next_line = f.readline()
-                    if next_line:
-                        line += next_line.strip()
-                    else:
-                        break
-
-                patterns.append(line)
+            # 使用 gitwildmatch 模式，这是 Git 使用的通配符规则
+            spec = pathspec.PathSpec.from_lines('gitwildmatch', f)
+        return spec
     except Exception as e:
-        print(f"读取 .gitignore 文件失败: {e}")
-        return []
-
-    return patterns
+        print(f"解析 .gitignore 文件失败: {e}")
+        return None
 
 
-def match_gitignore_pattern(pattern: str, path: str, is_dir: bool = False) -> bool:
+def should_exclude_by_gitignore(
+    rel_path: Path,
+    gitignore_spec,
+    is_dir: bool = False
+) -> bool:
     """
-    检查路径是否匹配 gitignore 模式
+    检查文件或目录是否应该根据 .gitignore 规则排除
 
     Args:
-        pattern: gitignore 模式
-        path: 要检查的路径（相对于仓库根目录）
+        rel_path: 相对于根目录的路径
+        gitignore_spec: pathspec.PathSpec 对象
         is_dir: 是否为目录
-
-    Returns:
-        True 如果匹配，否则 False
-    """
-    # 处理以 / 结尾的模式（只匹配目录）
-    if pattern.endswith('/'):
-        if not is_dir:
-            return False
-        pattern = pattern[:-1]
-
-    # 处理以 / 开头的模式（从根目录开始匹配）
-    if pattern.startswith('/'):
-        pattern = pattern[1:]
-        # 使用 fnmatch 进行精确匹配
-        return fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(path, pattern + '/*')
-
-    # 处理包含 / 的模式（匹配特定路径）
-    if '/' in pattern:
-        # 检查是否匹配完整路径
-        if fnmatch.fnmatch(path, pattern):
-            return True
-        # 检查是否匹配任意深度的路径
-        parts = path.split('/')
-        pattern_parts = pattern.split('/')
-        for i in range(len(parts) - len(pattern_parts) + 1):
-            if fnmatch.fnmatch('/'.join(parts[i:i+len(pattern_parts)]), pattern):
-                return True
-        return False
-
-    # 普通模式：匹配任意深度的文件或目录
-    # 检查文件名是否匹配
-    filename = path.split('/')[-1]
-    if fnmatch.fnmatch(filename, pattern):
-        return True
-
-    # 检查完整路径的任意部分
-    for part in path.split('/'):
-        if fnmatch.fnmatch(part, pattern):
-            return True
-
-    return False
-
-
-def should_exclude_by_gitignore(rel_path: Path, gitignore_patterns: List[str]) -> bool:
-    """
-    检查文件是否应该根据 gitignore 规则排除
-
-    Args:
-        rel_path: 文件的相对路径
-        gitignore_patterns: gitignore 模式列表
 
     Returns:
         True 如果应该排除，否则 False
     """
-    if not gitignore_patterns:
+    if gitignore_spec is None:
         return False
 
     path_str = rel_path.as_posix()
 
-    # 检查每个模式
-    for pattern in gitignore_patterns:
-        if match_gitignore_pattern(pattern, path_str, False):
-            return True
-
-    return False
+    # pathspec 的 match_file 方法会正确处理所有 .gitignore 语法
+    # 包括 ** 递归通配符、目录专用模式等
+    return gitignore_spec.match_file(path_str)
 
 
-def should_exclude_by_config(file_path: Path, rel_path: Path, exclude_patterns: List[str]) -> bool:
+def should_exclude_by_config(
+    file_path: Path,
+    rel_path: Path,
+    exclude_patterns: List[str]
+) -> bool:
     """
     判断文件是否应该根据配置文件中的排除列表排除
 
@@ -208,14 +151,18 @@ def should_exclude_by_config(file_path: Path, rel_path: Path, exclude_patterns: 
         if pattern == rel_path_str:
             return True
         # 支持通配符匹配
-        if '*' in pattern:
+        if '*' in pattern or '?' in pattern:
             if fnmatch.fnmatch(file_name, pattern) or fnmatch.fnmatch(rel_path_str, pattern):
                 return True
 
     return False
 
 
-def collect_files(base_dir: Path, exclude_patterns: List[str], use_gitignore: bool) -> List[Tuple[Path, Path]]:
+def collect_files(
+    base_dir: Path,
+    exclude_patterns: List[str],
+    use_gitignore: bool
+) -> List[Tuple[Path, Path]]:
     """
     递归收集所有文件，返回列表，每个元素为 (绝对路径, 相对于base_dir的路径)
     跳过目录本身，只收集文件，根据排除列表和gitignore过滤
@@ -228,49 +175,75 @@ def collect_files(base_dir: Path, exclude_patterns: List[str], use_gitignore: bo
     files = []
     excluded_by_config = 0
     excluded_by_gitignore = 0
+    skipped_dirs_by_gitignore = 0
 
     # 解析 .gitignore
-    gitignore_patterns = []
+    gitignore_spec = None
     if use_gitignore:
-        gitignore_patterns = parse_gitignore(base_dir)
-        if gitignore_patterns:
-            print(f"已加载 .gitignore 规则，共 {len(gitignore_patterns)} 条模式")
+        gitignore_spec = load_gitignore_spec(base_dir)
+        if gitignore_spec:
+            print("已加载 .gitignore 规则")
         else:
-            print("未找到 .gitignore 文件或文件为空")
+            if PATHSPEC_AVAILABLE:
+                print("未找到 .gitignore 文件或文件为空")
 
     try:
         # os.walk 性能较好，适合大文件夹
-        for root, dirs, filenames in os.walk(base_dir):
+        for root, dirs, filenames in os.walk(base_dir, topdown=True):
             root_path = Path(root)
 
+            # 计算当前目录相对于 base_dir 的路径
+            if root_path == base_dir:
+                current_rel_path = Path(".")
+            else:
+                current_rel_path = root_path.relative_to(base_dir)
+
             # 过滤目录：根据 gitignore 规则跳过某些目录
-            if use_gitignore and gitignore_patterns:
+            # 需要在 topdown=True 时修改 dirs 列表
+            if use_gitignore and gitignore_spec:
                 filtered_dirs = []
                 for d in dirs:
                     dir_path = root_path / d
-                    rel_dir_path = dir_path.relative_to(base_dir)
-                    if not should_exclude_by_gitignore(rel_dir_path, gitignore_patterns):
-                        filtered_dirs.append(d)
+                    if current_rel_path == Path("."):
+                        dir_rel_path = Path(d)
+                    else:
+                        dir_rel_path = current_rel_path / d
+
+                    # 检查目录本身是否应该被排除
+                    if should_exclude_by_gitignore(dir_rel_path, gitignore_spec, is_dir=True):
+                        skipped_dirs_by_gitignore += 1
+                        continue  # 跳过整个目录
+
+                    filtered_dirs.append(d)
                 dirs[:] = filtered_dirs
 
+            # 处理文件
             for fname in filenames:
                 file_path = root_path / fname
-                # 只处理文件，不处理链接等
-                if file_path.is_file():
-                    rel_path = file_path.relative_to(base_dir)
 
-                    # 检查配置文件排除列表
-                    if should_exclude_by_config(file_path, rel_path, exclude_patterns):
-                        excluded_by_config += 1
+                # 只处理普通文件，跳过符号链接等
+                if not file_path.is_file():
+                    continue
+
+                # 计算相对路径
+                if current_rel_path == Path("."):
+                    rel_path = Path(fname)
+                else:
+                    rel_path = current_rel_path / fname
+
+                # 检查配置文件排除列表
+                if should_exclude_by_config(file_path, rel_path, exclude_patterns):
+                    excluded_by_config += 1
+                    continue
+
+                # 检查 gitignore 规则
+                if use_gitignore and gitignore_spec:
+                    if should_exclude_by_gitignore(rel_path, gitignore_spec, is_dir=False):
+                        excluded_by_gitignore += 1
                         continue
 
-                    # 检查 gitignore 规则
-                    if use_gitignore and gitignore_patterns:
-                        if should_exclude_by_gitignore(rel_path, gitignore_patterns):
-                            excluded_by_gitignore += 1
-                            continue
+                files.append((file_path, rel_path))
 
-                    files.append((file_path, rel_path))
     except Exception as e:
         print(f"遍历文件夹时出错: {e}")
 
@@ -278,6 +251,8 @@ def collect_files(base_dir: Path, exclude_patterns: List[str], use_gitignore: bo
         print(f"已排除 {excluded_by_config} 个文件（根据配置文件排除列表）")
     if excluded_by_gitignore > 0:
         print(f"已排除 {excluded_by_gitignore} 个文件（根据 .gitignore 规则）")
+    if skipped_dirs_by_gitignore > 0:
+        print(f"已跳过 {skipped_dirs_by_gitignore} 个目录（根据 .gitignore 规则）")
 
     return files
 
@@ -288,7 +263,6 @@ def write_output(output_path: Path, base_dir: Path, files: List[Tuple[Path, Path
     相对路径\n
     文件内容\n\n\n
     """
-    # 使用缓冲区写入，提高大文件性能
     try:
         with open(output_path, 'w', encoding='utf-8', errors='replace') as out:
             for abs_path, rel_path in files:
@@ -316,6 +290,12 @@ def write_output(output_path: Path, base_dir: Path, files: List[Tuple[Path, Path
 
 def main():
     print("=== 文件内容收集器 ===")
+
+    # 检查 pathspec 是否可用
+    if not PATHSPEC_AVAILABLE:
+        print("提示: 安装 pathspec 库可获得完整的 .gitignore 支持")
+        print("      pip install pathspec")
+        print()
 
     # 1. 获取目标文件夹、排除列表和gitignore设置
     target_dir_str, exclude_list, use_gitignore = load_config()
