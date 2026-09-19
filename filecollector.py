@@ -396,6 +396,8 @@ def collect_files(
     excluded_by_gitignore = 0
     skipped_dirs_by_gitignore = 0
     gitignore_files = 0
+    skipped_symlinks = 0
+    skipped_not_regular = 0
     matcher = build_matcher(exclude_patterns, "exclude_files")
 
     # .gitignore 规则栈: (基准目录相对路径, 匹配器)，随遍历深度出入栈
@@ -403,7 +405,7 @@ def collect_files(
 
     try:
         # os.walk 性能较好，适合大文件夹
-        for root, dirs, filenames in os.walk(base_dir, topdown=True):
+        for root, dirs, filenames in os.walk(base_dir, topdown=True, followlinks=False):
             root_path = Path(root)
 
             # 计算当前目录相对于 base_dir 的路径
@@ -432,6 +434,11 @@ def collect_files(
             for d in dirs:
                 dir_rel_posix = f"{current_rel_posix}/{d}" if current_rel_posix else d
 
+                # 符号链接目录不跟随，避免循环与收集到目标目录之外
+                if (root_path / d).is_symlink():
+                    skipped_symlinks += 1
+                    continue
+
                 # 检查配置文件排除列表
                 if matcher is not None and matcher.should_prune_dir(dir_rel_posix):
                     pruned_dirs_by_config += 1
@@ -450,8 +457,12 @@ def collect_files(
             for fname in filenames:
                 file_path = root_path / fname
 
-                # 只处理普通文件，跳过符号链接等
+                # 只处理普通文件: 跳过符号链接、目录、设备文件等
+                if file_path.is_symlink():
+                    skipped_symlinks += 1
+                    continue
                 if not file_path.is_file():
+                    skipped_not_regular += 1
                     continue
 
                 # 计算相对路径
@@ -489,6 +500,8 @@ def collect_files(
             print(f"已加载 {gitignore_files} 个 .gitignore 文件")
         elif PATHSPEC_AVAILABLE:
             print("未找到 .gitignore 文件或文件为空")
+    if skipped_symlinks > 0:
+        print(f"已跳过 {skipped_symlinks} 个符号链接")
 
     return files
 
