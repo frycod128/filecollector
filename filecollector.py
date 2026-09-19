@@ -6,6 +6,7 @@
 import os
 import sys
 import json
+import io
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
@@ -16,6 +17,10 @@ CONFIG_FILE = "collector_config.json"
 
 # 用于判断"整个目录都会被排除"的探针文件名
 PROBE_NAME = "__file_collector_probe__"
+
+# 读写分块大小与二进制探测长度
+CHUNK_SIZE = 8192
+BINARY_SNIFF_SIZE = 8192
 
 # 尝试导入 pathspec，如果未安装则提示
 try:
@@ -43,6 +48,13 @@ class Config:
     target_directory: Path
     exclude_patterns: List[str]
     use_gitignore: bool
+
+
+@dataclass
+class WriteStats:
+    """写文件阶段的统计信息"""
+    binary_files: int = 0
+    read_errors: int = 0
 
 
 def get_config_path() -> Path:
@@ -506,12 +518,17 @@ def collect_files(
     return files
 
 
-def write_output(output_path: Path, base_dir: Path, files: List[Tuple[Path, Path]]) -> None:
+def write_output(output_path: Path, files: List[Tuple[Path, Path]]) -> WriteStats:
     """
-    将文件列表写入输出文件，格式：
-    相对路径\n
-    文件内容\n\n\n
+    把文件列表写入输出文件，格式为:
+
+        相对路径
+        文件内容
+
+    文件之间以两个空行分隔。
     """
+    stats = WriteStats()
+
     try:
         # newline="\n" 让输出换行符与平台无关，便于 diff 与跨平台读取
         with open(output_path, "w", encoding="utf-8", errors="replace", newline="\n") as out:
@@ -521,21 +538,32 @@ def write_output(output_path: Path, base_dir: Path, files: List[Tuple[Path, Path
 
                 # 读取文件内容并写入
                 try:
-                    with open(abs_path, 'r', encoding='utf-8', errors='replace') as inf:
-                        # 分块读取大文件，避免一次性加载到内存
-                        while True:
-                            chunk = inf.read(8192)  # 8KB块
-                            if not chunk:
-                                break
-                            out.write(chunk)
-                except Exception as e:
-                    # 读取失败时记录错误信息
+                    with open(abs_path, "rb") as inf:
+                        head = inf.read(BINARY_SNIFF_SIZE)
+                        if b"\x00" in head:
+                            # 二进制文件按文本读取只会得到乱码，这里只保留路径占位
+                            stats.binary_files += 1
+                            out.write("[已跳过二进制文件]\n")
+                        else:
+                            inf.seek(0)
+                            with io.TextIOWrapper(inf, encoding="utf-8", errors="replace") as text:
+                                # 分块读取大文件，避免一次性加载到内存
+                                while True:
+                                    chunk = text.read(CHUNK_SIZE)  # 8KB块
+                                    if not chunk:
+                                        break
+                                    out.write(chunk)
+                except OSError as e:
+                    # 读取失败时记录错误信息，不影响其它文件
+                    stats.read_errors += 1
                     out.write(f"[读取文件失败: {e}]\n")
 
                 # 写入三个换行符作为分隔
                 out.write('\n\n\n')
-    except Exception as e:
-        print(f"写入输出文件失败: {e}")
+    except OSError as e:
+        print(f"写入输出文件失败: {output_path} ({e})")
+
+    return stats
 
 
 def main() -> int:
@@ -573,7 +601,9 @@ def main() -> int:
 
     # 4. 写入内容
     print("正在写入文件内容（可能需要一段时间）...")
-    write_output(output_file, target_dir, files)
+    write_stats = write_output(output_file, files)
+    if write_stats.binary_files > 0:
+        print(f"已跳过 {write_stats.binary_files} 个二进制文件")
 
     print("完成！")
     return 0
