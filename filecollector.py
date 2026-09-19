@@ -12,8 +12,9 @@ from fnmatch import fnmatchcase
 from pathlib import Path
 from typing import List, Tuple, Optional, Sequence
 
-# 配置文件名称
+# 配置文件与输出文件的名称
 CONFIG_FILE = "collector_config.json"
+OUTPUT_FILE = "collected_contents.txt"
 
 # 用于判断"整个目录都会被排除"的探针文件名
 PROBE_NAME = "__file_collector_probe__"
@@ -79,8 +80,8 @@ def load_config() -> Optional[Config]:
         default_config = {
             "target_directory": str(Path.cwd()),
             "exclude_files": [
-                "collected_contents.txt",
-                "collector_config.json",
+                OUTPUT_FILE,
+                CONFIG_FILE,
             ],
             "use_gitignore": False,
         }
@@ -391,7 +392,8 @@ def match_gitignore_stack(
 def collect_files(
     base_dir: Path,
     exclude_patterns: List[str],
-    use_gitignore: bool
+    use_gitignore: bool,
+    output_path: Optional[Path] = None
 ) -> List[Tuple[Path, Path]]:
     """
     递归收集所有文件，返回列表，每个元素为 (绝对路径, 相对于base_dir的路径)
@@ -401,6 +403,7 @@ def collect_files(
         base_dir: 目标文件夹路径
         exclude_patterns: 配置文件的排除模式列表
         use_gitignore: 是否使用 .gitignore 规则
+        output_path: 输出文件路径，收集时始终排除自身，避免自我引用
     """
     files = []
     excluded_by_config = 0
@@ -468,6 +471,10 @@ def collect_files(
             # 处理文件
             for fname in filenames:
                 file_path = root_path / fname
+
+                # 输出文件自身永远不参与收集，避免自我引用
+                if output_path is not None and file_path == output_path:
+                    continue
 
                 # 只处理普通文件: 跳过符号链接、目录、设备文件等
                 if file_path.is_symlink():
@@ -586,18 +593,23 @@ def main() -> int:
         print(f"配置文件排除模式: {', '.join(config.exclude_patterns)}")
     print(f"遵循 .gitignore: {'是' if config.use_gitignore else '否'}")
 
-    # 2. 递归收集文件列表
+    # 2. 输出文件固定放在目标文件夹内
+    output_file = target_dir / OUTPUT_FILE
+    print(f"输出文件: {output_file}")
+
+    # 3. 递归收集文件列表（输出文件自身始终排除）
     print("正在收集文件列表...")
-    files = collect_files(target_dir, config.exclude_patterns, config.use_gitignore)
+    files = collect_files(
+        target_dir,
+        config.exclude_patterns,
+        config.use_gitignore,
+        output_path=output_file,
+    )
     print(f"共找到 {len(files)} 个文件。")
 
     if not files:
         print("未找到任何文件。")
         return 0
-
-    # 3. 确定输出文件路径（在目标文件夹内）
-    output_file = target_dir / "collected_contents.txt"
-    print(f"输出文件: {output_file}")
 
     # 4. 写入内容
     print("正在写入文件内容（可能需要一段时间）...")
