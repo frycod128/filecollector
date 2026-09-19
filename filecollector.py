@@ -6,13 +6,16 @@
 import os
 import sys
 import json
-import fnmatch
 from dataclasses import dataclass
+from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Sequence
 
 # 配置文件名称
 CONFIG_FILE = "collector_config.json"
+
+# 用于判断"整个目录都会被排除"的探针文件名
+PROBE_NAME = "__file_collector_probe__"
 
 # 尝试导入 pathspec，如果未安装则提示
 try:
@@ -20,6 +23,18 @@ try:
     PATHSPEC_AVAILABLE = True
 except ImportError:
     PATHSPEC_AVAILABLE = False
+
+try:
+    from pathspec.util import normalize_file as _normalize_file
+except Exception:  # 极老版本没有该工具函数时的兜底
+    def _normalize_file(file, separators=None) -> str:
+        """把路径统一成 POSIX 风格并去掉开头的 / 与 ./"""
+        text = str(file).replace("\\", "/")
+        while text.startswith("./"):
+            text = text[2:]
+        if text.startswith("/"):
+            text = text[1:]
+        return text
 
 
 @dataclass
@@ -178,38 +193,194 @@ def should_exclude_by_gitignore(
     return gitignore_spec.match_file(path_str)
 
 
-def should_exclude_by_config(
-    file_path: Path,
-    rel_path: Path,
-    exclude_patterns: List[str]
-) -> bool:
+def to_git_pattern(pattern: str) -> str:
     """
-    判断文件是否应该根据配置文件中的排除列表排除
+    把配置文件里的排除模式转换成 Git 通配模式。
 
-    Args:
-        file_path: 文件的绝对路径
-        rel_path: 文件的相对路径
-        exclude_patterns: 排除模式列表
-
-    Returns:
-        True 如果文件应该被排除，否则 False
+    规则:
+    - 反斜杠统一成 /，便于在 Windows 上书写
+    - 以 / 开头: 相对目标目录定位（与 Git 一致），如 /build 只匹配根目录下的 build
+    - 其余含 / 的模式: 在任意层级匹配，如 node_modules/* 匹配任何层级的 node_modules
+    - 不含 / 的模式: 本身就在任意层级匹配（Git 语义），如 *.log、temp_*
+    - 以 ! 开头: 取反，重新包含此前被排除的文件
+    - 以 / 结尾: 只匹配目录
     """
-    file_name = file_path.name
-    rel_path_str = rel_path.as_posix()
+    text = pattern.strip().replace("\\", "/")
+    if not text:
+        return ""
 
-    for pattern in exclude_patterns:
-        # 精确匹配文件名
-        if pattern == file_name:
-            return True
-        # 精确匹配相对路径
-        if pattern == rel_path_str:
-            return True
-        # 支持通配符匹配
-        if '*' in pattern or '?' in pattern:
-            if fnmatch.fnmatch(file_name, pattern) or fnmatch.fnmatch(rel_path_str, pattern):
-                return True
+    negation = ""
+    if text.startswith("!"):
+        negation, text = "!", text[1:].lstrip()
+    elif text.startswith("\\!"):
+        # \! 表示文件名真的以 ! 开头
+        text = text[1:]
 
-    return False
+    if not text:
+        return ""
+    if text.startswith("/") or text.startswith("**"):
+        return negation + text
+    if "/" in text.rstrip("/"):
+        return negation + "**/" + text
+    return negation + text
+
+
+def build_spec(lines: Sequence[str]):
+    """把若干行 Git 模式编译成 PathSpec，失败或为空时返回 None"""
+    if not lines or not PATHSPEC_AVAILABLE:
+        return None
+
+    try:
+        if hasattr(pathspec, "GitIgnoreSpec"):
+            # pathspec >= 0.10 的推荐用法，行为与 Git 一致
+            spec = pathspec.GitIgnoreSpec.from_lines(list(lines))
+        else:  # pragma: no cover - 老版本兜底
+            spec = pathspec.PathSpec.from_lines("gitwildmatch", list(lines))
+    except Exception as e:
+        print(f"解析排除规则失败: {e}")
+        return None
+
+    return spec if spec.patterns else None
+
+
+class PatternMatcher:
+    """
+    排除规则匹配器，封装 Git 通配匹配与"目录能否整棵跳过"的判断。
+
+    match() 的返回值:
+    - True: 命中排除规则
+    - False: 命中 ! 取反规则（明确保留）
+    - None: 没有规则命中
+    """
+
+    def __init__(self, spec, label: str = "排除规则"):
+        self.label = label
+        self.spec = spec
+        # 有 ! 取反规则时不做探针剪枝，避免误剪掉被重新包含的文件
+        self.can_probe_prune = spec is not None and not any(
+            getattr(pattern, "include", True) is False for pattern in spec.patterns
+        )
+
+    @classmethod
+    def from_patterns(cls, patterns: Sequence[str], label: str = "排除规则"):
+        """用配置文件里的模式列表构建匹配器"""
+        git_patterns = [to_git_pattern(p) for p in patterns]
+        git_patterns = [p for p in git_patterns if p]
+        return cls(build_spec(git_patterns), label)
+
+    def match(self, rel_posix: str, is_dir: bool = False) -> Optional[bool]:
+        """
+        判断相对路径是否被排除。
+
+        is_dir 为 True 时补上尾斜杠，这样才能命中 Git 的"仅目录"规则（如 build/）。
+        """
+        if self.spec is None or not rel_posix:
+            return None
+
+        path = rel_posix + "/" if is_dir else rel_posix
+        norm_path = _normalize_file(path)
+
+        try:
+            # 逆序扫描: Git 是"最后一条匹配的规则生效"
+            for pattern in reversed(self.spec.patterns):
+                if getattr(pattern, "include", None) is None:
+                    continue
+                if pattern.match_file(norm_path) is not None:
+                    return bool(pattern.include)
+        except Exception as e:
+            print(f"匹配规则出错（{self.label} / {rel_posix}）: {e}")
+            return None
+
+        return None
+
+    def should_prune_dir(self, rel_posix: str) -> Optional[bool]:
+        """
+        判断目录能否整棵跳过。
+
+        先看目录本身是否命中规则；若没有，再用一个假想的子文件试探
+        （node_modules/* 这类模式不匹配目录本身，但会排除它下面的所有内容）。
+        """
+        decision = self.match(rel_posix, is_dir=True)
+        if decision is not None:
+            return decision
+        if self.can_probe_prune:
+            return self.match(f"{rel_posix}/{PROBE_NAME}", is_dir=False)
+        return None
+
+
+class SimplePatternMatcher:
+    """
+    未安装 pathspec 时的简化匹配器。
+
+    支持 * ? [] 通配、任意层级匹配与 ! 取反，但不支持 ** 与目录专用等完整 Git 语法。
+    """
+
+    def __init__(self, patterns: Sequence[str]):
+        self.rules: List[Tuple[bool, str]] = []
+        for pattern in patterns:
+            text = pattern.strip().replace("\\", "/")
+            if not text:
+                continue
+            negate = text.startswith("!")
+            if negate:
+                text = text[1:].lstrip()
+            text = text.lstrip("/")
+            if text:
+                self.rules.append((negate, text))
+        self.can_probe_prune = bool(self.rules) and not any(negate for negate, _ in self.rules)
+
+    @classmethod
+    def from_patterns(cls, patterns: Sequence[str], label: str = "排除规则"):
+        return cls(patterns)
+
+    @staticmethod
+    def _candidates(rel_posix: str) -> List[str]:
+        """相对路径本身以及它的各级后缀，用于实现任意层级匹配"""
+        parts = [p for p in rel_posix.split("/") if p]
+        return ["/".join(parts[i:]) for i in range(len(parts))]
+
+    def match(self, rel_posix: str, is_dir: bool = False) -> Optional[bool]:
+        if not rel_posix:
+            return None
+
+        candidates = self._candidates(rel_posix)
+        decision = None
+
+        for negate, raw in self.rules:
+            dir_only = raw.endswith("/")
+            pattern = raw.rstrip("/")
+            if not pattern:
+                continue
+
+            hit = any(fnmatchcase(c, pattern) for c in candidates)
+            if not hit and dir_only:
+                # 目录规则: 目录自身及其内部所有内容都算命中
+                hit = any(fnmatchcase(c + "/", pattern) for c in candidates)
+                hit = hit or any(f"/{pattern}/" in f"/{c}/" for c in candidates)
+            if hit:
+                decision = not negate
+
+        return decision
+
+    def should_prune_dir(self, rel_posix: str) -> Optional[bool]:
+        decision = self.match(rel_posix, is_dir=True)
+        if decision is not None:
+            return decision
+        if self.can_probe_prune and self.match(f"{rel_posix}/{PROBE_NAME}", is_dir=False):
+            return True
+        return None
+
+
+def build_matcher(patterns: Sequence[str], label: str = "排除规则"):
+    """构建排除规则匹配器（优先 pathspec，未安装时使用简化实现）"""
+    if not patterns:
+        return None
+    if PATHSPEC_AVAILABLE:
+        matcher = PatternMatcher.from_patterns(patterns, label)
+        return matcher if matcher.spec is not None else None
+    print(f"警告: 未安装 pathspec 库，{label} 将使用简化匹配（不支持 ** 与目录专用语法）")
+    print("建议执行: pip install pathspec")
+    return SimplePatternMatcher.from_patterns(patterns, label)
 
 
 def collect_files(
@@ -228,8 +399,10 @@ def collect_files(
     """
     files = []
     excluded_by_config = 0
+    pruned_dirs_by_config = 0
     excluded_by_gitignore = 0
     skipped_dirs_by_gitignore = 0
+    matcher = build_matcher(exclude_patterns, "exclude_files")
 
     # 解析 .gitignore
     gitignore_spec = None
@@ -252,24 +425,29 @@ def collect_files(
             else:
                 current_rel_path = root_path.relative_to(base_dir)
 
-            # 过滤目录：根据 gitignore 规则跳过某些目录
+            # 过滤目录：命中排除规则时整棵跳过，可以显著减少遍历量
             # 需要在 topdown=True 时修改 dirs 列表
-            if use_gitignore and gitignore_spec:
-                filtered_dirs = []
-                for d in dirs:
-                    dir_path = root_path / d
-                    if current_rel_path == Path("."):
-                        dir_rel_path = Path(d)
-                    else:
-                        dir_rel_path = current_rel_path / d
+            filtered_dirs = []
+            for d in dirs:
+                dir_path = root_path / d
+                if current_rel_path == Path("."):
+                    dir_rel_path = Path(d)
+                else:
+                    dir_rel_path = current_rel_path / d
 
-                    # 检查目录本身是否应该被排除
+                # 检查配置文件排除列表
+                if matcher is not None and matcher.should_prune_dir(dir_rel_path.as_posix()):
+                    pruned_dirs_by_config += 1
+                    continue  # 跳过整个目录
+
+                # 检查 gitignore 规则
+                if use_gitignore and gitignore_spec:
                     if should_exclude_by_gitignore(dir_rel_path, gitignore_spec, is_dir=True):
                         skipped_dirs_by_gitignore += 1
                         continue  # 跳过整个目录
 
-                    filtered_dirs.append(d)
-                dirs[:] = filtered_dirs
+                filtered_dirs.append(d)
+            dirs[:] = filtered_dirs
 
             # 处理文件
             for fname in filenames:
@@ -286,7 +464,7 @@ def collect_files(
                     rel_path = current_rel_path / fname
 
                 # 检查配置文件排除列表
-                if should_exclude_by_config(file_path, rel_path, exclude_patterns):
+                if matcher is not None and matcher.match(rel_path.as_posix(), is_dir=False):
                     excluded_by_config += 1
                     continue
 
@@ -303,6 +481,8 @@ def collect_files(
 
     if excluded_by_config > 0:
         print(f"已排除 {excluded_by_config} 个文件（根据配置文件排除列表）")
+    if pruned_dirs_by_config > 0:
+        print(f"已跳过 {pruned_dirs_by_config} 个目录（根据配置文件排除列表）")
     if excluded_by_gitignore > 0:
         print(f"已排除 {excluded_by_gitignore} 个文件（根据 .gitignore 规则）")
     if skipped_dirs_by_gitignore > 0:
