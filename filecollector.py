@@ -138,61 +138,6 @@ def load_config() -> Optional[Config]:
     )
 
 
-def load_gitignore_spec(base_dir: Path):
-    """
-    使用 pathspec 库解析 .gitignore 文件
-
-    Args:
-        base_dir: 目标文件夹路径
-
-    Returns:
-        pathspec.PathSpec 对象，如果没有 .gitignore 或 pathspec 不可用则返回 None
-    """
-    if not PATHSPEC_AVAILABLE:
-        print("警告: 未安装 pathspec 库，.gitignore 功能将使用简化实现（可能不完整）")
-        print("建议执行: pip install pathspec")
-        return None
-
-    gitignore_path = base_dir / ".gitignore"
-    if not gitignore_path.exists():
-        return None
-
-    try:
-        with open(gitignore_path, 'r', encoding='utf-8', errors='replace') as f:
-            # 使用 gitwildmatch 模式，这是 Git 使用的通配符规则
-            spec = pathspec.PathSpec.from_lines('gitwildmatch', f)
-        return spec
-    except Exception as e:
-        print(f"解析 .gitignore 文件失败: {e}")
-        return None
-
-
-def should_exclude_by_gitignore(
-    rel_path: Path,
-    gitignore_spec,
-    is_dir: bool = False
-) -> bool:
-    """
-    检查文件或目录是否应该根据 .gitignore 规则排除
-
-    Args:
-        rel_path: 相对于根目录的路径
-        gitignore_spec: pathspec.PathSpec 对象
-        is_dir: 是否为目录
-
-    Returns:
-        True 如果应该排除，否则 False
-    """
-    if gitignore_spec is None:
-        return False
-
-    path_str = rel_path.as_posix()
-
-    # pathspec 的 match_file 方法会正确处理所有 .gitignore 语法
-    # 包括 ** 递归通配符、目录专用模式等
-    return gitignore_spec.match_file(path_str)
-
-
 def to_git_pattern(pattern: str) -> str:
     """
     把配置文件里的排除模式转换成 Git 通配模式。
@@ -383,6 +328,54 @@ def build_matcher(patterns: Sequence[str], label: str = "排除规则"):
     return SimplePatternMatcher.from_patterns(patterns, label)
 
 
+def load_gitignore_spec(directory: Path):
+    """读取指定目录下的 .gitignore 并编译成匹配器，没有则返回 None"""
+    gitignore_path = directory / ".gitignore"
+    if not gitignore_path.is_file():
+        return None
+
+    try:
+        with open(gitignore_path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.read().splitlines()
+    except OSError as e:
+        print(f"读取 .gitignore 失败: {gitignore_path} ({e})")
+        return None
+
+    matcher = PatternMatcher(build_spec(lines), str(gitignore_path))
+    return matcher if matcher.spec is not None else None
+
+
+def is_within(rel_posix: str, base_posix: str) -> bool:
+    """判断相对路径是否位于某个基准目录内（含基准目录自身）"""
+    if not base_posix:
+        return True
+    return rel_posix == base_posix or rel_posix.startswith(base_posix + "/")
+
+
+def match_gitignore_stack(
+    stack: Sequence[Tuple[str, PatternMatcher]],
+    rel_posix: str,
+    is_dir: bool = False
+) -> Optional[bool]:
+    """
+    按 Git 的层级规则匹配: 越靠近文件的 .gitignore 优先级越高。
+
+    stack 中的元素为 (基准目录相对路径, 匹配器)，按由浅到深排列。
+    """
+    for base_posix, matcher in reversed(stack):
+        sub_path = rel_posix if not base_posix else rel_posix[len(base_posix) + 1:]
+        if not sub_path:
+            continue
+        decision = (
+            matcher.should_prune_dir(sub_path)
+            if is_dir
+            else matcher.match(sub_path, is_dir=False)
+        )
+        if decision is not None:
+            return decision
+    return None
+
+
 def collect_files(
     base_dir: Path,
     exclude_patterns: List[str],
@@ -402,17 +395,11 @@ def collect_files(
     pruned_dirs_by_config = 0
     excluded_by_gitignore = 0
     skipped_dirs_by_gitignore = 0
+    gitignore_files = 0
     matcher = build_matcher(exclude_patterns, "exclude_files")
 
-    # 解析 .gitignore
-    gitignore_spec = None
-    if use_gitignore:
-        gitignore_spec = load_gitignore_spec(base_dir)
-        if gitignore_spec:
-            print("已加载 .gitignore 规则")
-        else:
-            if PATHSPEC_AVAILABLE:
-                print("未找到 .gitignore 文件或文件为空")
+    # .gitignore 规则栈: (基准目录相对路径, 匹配器)，随遍历深度出入栈
+    gitignore_stack: List[Tuple[str, PatternMatcher]] = []
 
     try:
         # os.walk 性能较好，适合大文件夹
@@ -424,25 +411,31 @@ def collect_files(
                 current_rel_path = Path(".")
             else:
                 current_rel_path = root_path.relative_to(base_dir)
+            current_rel_posix = "" if current_rel_path == Path(".") else current_rel_path.as_posix()
+
+            # 先弹出已离开当前分支的规则，再压入当前目录的 .gitignore
+            while gitignore_stack and not is_within(current_rel_posix, gitignore_stack[-1][0]):
+                gitignore_stack.pop()
+            if use_gitignore:
+                gitignore_matcher = load_gitignore_spec(root_path)
+                if gitignore_matcher is not None:
+                    gitignore_stack.append((current_rel_posix, gitignore_matcher))
+                    gitignore_files += 1
 
             # 过滤目录：命中排除规则时整棵跳过，可以显著减少遍历量
             # 需要在 topdown=True 时修改 dirs 列表
             filtered_dirs = []
             for d in dirs:
-                dir_path = root_path / d
-                if current_rel_path == Path("."):
-                    dir_rel_path = Path(d)
-                else:
-                    dir_rel_path = current_rel_path / d
+                dir_rel_posix = f"{current_rel_posix}/{d}" if current_rel_posix else d
 
                 # 检查配置文件排除列表
-                if matcher is not None and matcher.should_prune_dir(dir_rel_path.as_posix()):
+                if matcher is not None and matcher.should_prune_dir(dir_rel_posix):
                     pruned_dirs_by_config += 1
                     continue  # 跳过整个目录
 
                 # 检查 gitignore 规则
-                if use_gitignore and gitignore_spec:
-                    if should_exclude_by_gitignore(dir_rel_path, gitignore_spec, is_dir=True):
+                if use_gitignore and gitignore_stack:
+                    if match_gitignore_stack(gitignore_stack, dir_rel_posix, is_dir=True):
                         skipped_dirs_by_gitignore += 1
                         continue  # 跳过整个目录
 
@@ -469,8 +462,8 @@ def collect_files(
                     continue
 
                 # 检查 gitignore 规则
-                if use_gitignore and gitignore_spec:
-                    if should_exclude_by_gitignore(rel_path, gitignore_spec, is_dir=False):
+                if use_gitignore and gitignore_stack:
+                    if match_gitignore_stack(gitignore_stack, rel_path.as_posix(), is_dir=False):
                         excluded_by_gitignore += 1
                         continue
 
@@ -487,6 +480,11 @@ def collect_files(
         print(f"已排除 {excluded_by_gitignore} 个文件（根据 .gitignore 规则）")
     if skipped_dirs_by_gitignore > 0:
         print(f"已跳过 {skipped_dirs_by_gitignore} 个目录（根据 .gitignore 规则）")
+    if use_gitignore:
+        if gitignore_files > 0:
+            print(f"已加载 {gitignore_files} 个 .gitignore 文件")
+        elif PATHSPEC_AVAILABLE:
+            print("未找到 .gitignore 文件或文件为空")
 
     return files
 
