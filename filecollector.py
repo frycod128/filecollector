@@ -16,6 +16,11 @@ from typing import List, Tuple, Optional, Sequence
 CONFIG_FILE = "collector_config.json"
 OUTPUT_FILE = "collected_contents.txt"
 
+# 每个文件之间的空行数量: 默认值与合法范围
+DEFAULT_NEWLINES_BETWEEN_FILES = 2
+MIN_NEWLINES_BETWEEN_FILES = 0
+MAX_NEWLINES_BETWEEN_FILES = 1000
+
 # 用于判断"整个目录都会被排除"的探针文件名
 PROBE_NAME = "__file_collector_probe__"
 
@@ -49,6 +54,7 @@ class Config:
     target_directory: Path
     exclude_patterns: List[str]
     use_gitignore: bool
+    newlines_between_files: int
 
 
 @dataclass
@@ -65,6 +71,32 @@ def get_config_path() -> Path:
     except NameError:  # pragma: no cover - 交互式执行等特殊情况
         script_dir = Path(sys.argv[0]).resolve().parent
     return script_dir / CONFIG_FILE
+
+
+def parse_newlines_between_files(raw_value, present: bool) -> int:
+    """
+    校验"每个文件之间的空行数量"配置项
+
+    合法值为 0~1000 的整数，缺失或不合法时使用默认值 2。
+    """
+    if not present:
+        return DEFAULT_NEWLINES_BETWEEN_FILES
+
+    valid = (
+        isinstance(raw_value, int)
+        and not isinstance(raw_value, bool)
+        and MIN_NEWLINES_BETWEEN_FILES <= raw_value <= MAX_NEWLINES_BETWEEN_FILES
+    )
+    if valid:
+        return raw_value
+
+    print(
+        "配置项 newlines_between_files 不合法: "
+        f"{raw_value!r}（应为 {MIN_NEWLINES_BETWEEN_FILES}~"
+        f"{MAX_NEWLINES_BETWEEN_FILES} 的整数），"
+        f"已使用默认值 {DEFAULT_NEWLINES_BETWEEN_FILES}。"
+    )
+    return DEFAULT_NEWLINES_BETWEEN_FILES
 
 
 def load_config() -> Optional[Config]:
@@ -84,6 +116,7 @@ def load_config() -> Optional[Config]:
                 CONFIG_FILE,
             ],
             "use_gitignore": False,
+            "newlines_between_files": DEFAULT_NEWLINES_BETWEEN_FILES,
         }
         try:
             with open(config_path, "w", encoding="utf-8") as f:
@@ -144,10 +177,17 @@ def load_config() -> Optional[Config]:
         print(f"配置项 use_gitignore 应为 true/false，已按 false 处理: {gitignore_raw!r}")
         use_gitignore = False
 
+    # 文件之间的空行数量
+    newlines = parse_newlines_between_files(
+        raw_config.get("newlines_between_files"),
+        "newlines_between_files" in raw_config,
+    )
+
     return Config(
         target_directory=target_dir,
         exclude_patterns=exclude_patterns,
         use_gitignore=use_gitignore,
+        newlines_between_files=newlines,
     )
 
 
@@ -525,16 +565,23 @@ def collect_files(
     return files
 
 
-def write_output(output_path: Path, files: List[Tuple[Path, Path]]) -> WriteStats:
+def write_output(
+    output_path: Path,
+    files: List[Tuple[Path, Path]],
+    blank_lines: int
+) -> WriteStats:
     """
     把文件列表写入输出文件，格式为:
 
         相对路径
         文件内容
+        （blank_lines 个空行）
 
-    文件之间以两个空行分隔。
+    内容后始终先写 1 个换行，保证下一条路径独占一行，再写 blank_lines 个空行；
+    因此 blank_lines=2 时文件之间是两个空行（与旧版本输出一致）。
     """
     stats = WriteStats()
+    separator = "\n" * (blank_lines + 1)
 
     try:
         # newline="\n" 让输出换行符与平台无关，便于 diff 与跨平台读取
@@ -565,8 +612,8 @@ def write_output(output_path: Path, files: List[Tuple[Path, Path]]) -> WriteStat
                     stats.read_errors += 1
                     out.write(f"[读取文件失败: {e}]\n")
 
-                # 写入三个换行符作为分隔
-                out.write('\n\n\n')
+                # 写入分隔换行
+                out.write(separator)
     except OSError as e:
         print(f"写入输出文件失败: {output_path} ({e})")
 
@@ -613,7 +660,7 @@ def main() -> int:
 
     # 4. 写入内容
     print("正在写入文件内容（可能需要一段时间）...")
-    write_stats = write_output(output_file, files)
+    write_stats = write_output(output_file, files, config.newlines_between_files)
     if write_stats.binary_files > 0:
         print(f"已跳过 {write_stats.binary_files} 个二进制文件")
 
