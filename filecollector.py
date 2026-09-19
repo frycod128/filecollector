@@ -413,6 +413,10 @@ def collect_files(
                 current_rel_path = root_path.relative_to(base_dir)
             current_rel_posix = "" if current_rel_path == Path(".") else current_rel_path.as_posix()
 
+            # 排序保证输出顺序稳定（Windows 下大小写不敏感）
+            dirs.sort(key=str.casefold)
+            filenames.sort(key=str.casefold)
+
             # 先弹出已离开当前分支的规则，再压入当前目录的 .gitignore
             while gitignore_stack and not is_within(current_rel_posix, gitignore_stack[-1][0]):
                 gitignore_stack.pop()
@@ -496,7 +500,8 @@ def write_output(output_path: Path, base_dir: Path, files: List[Tuple[Path, Path
     文件内容\n\n\n
     """
     try:
-        with open(output_path, 'w', encoding='utf-8', errors='replace') as out:
+        # newline="\n" 让输出换行符与平台无关，便于 diff 与跨平台读取
+        with open(output_path, "w", encoding="utf-8", errors="replace", newline="\n") as out:
             for abs_path, rel_path in files:
                 # 写入相对路径（使用POSIX风格，统一用/分隔）
                 out.write(rel_path.as_posix() + '\n')
