@@ -10,7 +10,7 @@ import io
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from pathlib import Path
-from typing import List, Tuple, Optional, Sequence
+from typing import Dict, List, Tuple, Optional, Sequence
 
 # 配置文件与输出文件的名称
 CONFIG_FILE = "collector_config.json"
@@ -58,10 +58,24 @@ class Config:
 
 
 @dataclass
+class CollectStats:
+    """遍历阶段的统计信息"""
+    scanned_files: int = 0
+    excluded_by_config: int = 0
+    pruned_dirs_by_config: int = 0
+    excluded_by_gitignore: int = 0
+    pruned_dirs_by_gitignore: int = 0
+    gitignore_files: int = 0
+    skipped_symlinks: int = 0
+    skipped_not_regular: int = 0
+
+
+@dataclass
 class WriteStats:
     """写文件阶段的统计信息"""
     binary_files: int = 0
     read_errors: int = 0
+    output_bytes: int = 0
 
 
 def get_config_path() -> Path:
@@ -434,25 +448,15 @@ def collect_files(
     exclude_patterns: List[str],
     use_gitignore: bool,
     output_path: Optional[Path] = None
-) -> List[Tuple[Path, Path]]:
+) -> Tuple[List[Tuple[Path, Path]], CollectStats]:
     """
-    递归收集所有文件，返回列表，每个元素为 (绝对路径, 相对于base_dir的路径)
-    跳过目录本身，只收集文件，根据排除列表和gitignore过滤
+    递归收集所有文件，返回 (文件列表, 统计信息)。
 
-    Args:
-        base_dir: 目标文件夹路径
-        exclude_patterns: 配置文件的排除模式列表
-        use_gitignore: 是否使用 .gitignore 规则
-        output_path: 输出文件路径，收集时始终排除自身，避免自我引用
+    每个元素为 (绝对路径, 相对于 base_dir 的路径)。
+    排除规则有两个来源: 配置文件模式列表、各级 .gitignore（后者可用 use_gitignore 关闭）。
     """
-    files = []
-    excluded_by_config = 0
-    pruned_dirs_by_config = 0
-    excluded_by_gitignore = 0
-    skipped_dirs_by_gitignore = 0
-    gitignore_files = 0
-    skipped_symlinks = 0
-    skipped_not_regular = 0
+    stats = CollectStats()
+    files: List[Tuple[Path, Path]] = []
     matcher = build_matcher(exclude_patterns, "exclude_files")
 
     # .gitignore 规则栈: (基准目录相对路径, 匹配器)，随遍历深度出入栈
@@ -481,7 +485,7 @@ def collect_files(
                 gitignore_matcher = load_gitignore_spec(root_path)
                 if gitignore_matcher is not None:
                     gitignore_stack.append((current_rel_posix, gitignore_matcher))
-                    gitignore_files += 1
+                    stats.gitignore_files += 1
 
             # 过滤目录：命中排除规则时整棵跳过，可以显著减少遍历量
             # 需要在 topdown=True 时修改 dirs 列表
@@ -491,18 +495,18 @@ def collect_files(
 
                 # 符号链接目录不跟随，避免循环与收集到目标目录之外
                 if (root_path / d).is_symlink():
-                    skipped_symlinks += 1
+                    stats.skipped_symlinks += 1
                     continue
 
                 # 检查配置文件排除列表
                 if matcher is not None and matcher.should_prune_dir(dir_rel_posix):
-                    pruned_dirs_by_config += 1
+                    stats.pruned_dirs_by_config += 1
                     continue  # 跳过整个目录
 
                 # 检查 gitignore 规则
                 if use_gitignore and gitignore_stack:
                     if match_gitignore_stack(gitignore_stack, dir_rel_posix, is_dir=True):
-                        skipped_dirs_by_gitignore += 1
+                        stats.pruned_dirs_by_gitignore += 1
                         continue  # 跳过整个目录
 
                 filtered_dirs.append(d)
@@ -512,16 +516,18 @@ def collect_files(
             for fname in filenames:
                 file_path = root_path / fname
 
+                stats.scanned_files += 1
+
                 # 输出文件自身永远不参与收集，避免自我引用
                 if output_path is not None and file_path == output_path:
                     continue
 
                 # 只处理普通文件: 跳过符号链接、目录、设备文件等
                 if file_path.is_symlink():
-                    skipped_symlinks += 1
+                    stats.skipped_symlinks += 1
                     continue
                 if not file_path.is_file():
-                    skipped_not_regular += 1
+                    stats.skipped_not_regular += 1
                     continue
 
                 # 计算相对路径
@@ -532,13 +538,13 @@ def collect_files(
 
                 # 检查配置文件排除列表
                 if matcher is not None and matcher.match(rel_path.as_posix(), is_dir=False):
-                    excluded_by_config += 1
+                    stats.excluded_by_config += 1
                     continue
 
                 # 检查 gitignore 规则
                 if use_gitignore and gitignore_stack:
                     if match_gitignore_stack(gitignore_stack, rel_path.as_posix(), is_dir=False):
-                        excluded_by_gitignore += 1
+                        stats.excluded_by_gitignore += 1
                         continue
 
                 files.append((file_path, rel_path))
@@ -546,23 +552,7 @@ def collect_files(
     except Exception as e:
         print(f"遍历文件夹时出错: {e}")
 
-    if excluded_by_config > 0:
-        print(f"已排除 {excluded_by_config} 个文件（根据配置文件排除列表）")
-    if pruned_dirs_by_config > 0:
-        print(f"已跳过 {pruned_dirs_by_config} 个目录（根据配置文件排除列表）")
-    if excluded_by_gitignore > 0:
-        print(f"已排除 {excluded_by_gitignore} 个文件（根据 .gitignore 规则）")
-    if skipped_dirs_by_gitignore > 0:
-        print(f"已跳过 {skipped_dirs_by_gitignore} 个目录（根据 .gitignore 规则）")
-    if use_gitignore:
-        if gitignore_files > 0:
-            print(f"已加载 {gitignore_files} 个 .gitignore 文件")
-        elif PATHSPEC_AVAILABLE:
-            print("未找到 .gitignore 文件或文件为空")
-    if skipped_symlinks > 0:
-        print(f"已跳过 {skipped_symlinks} 个符号链接")
-
-    return files
+    return files, stats
 
 
 def write_output(
@@ -616,8 +606,54 @@ def write_output(
                 out.write(separator)
     except OSError as e:
         print(f"写入输出文件失败: {output_path} ({e})")
+        return stats
 
+    try:
+        stats.output_bytes = output_path.stat().st_size
+    except OSError:
+        stats.output_bytes = 0
     return stats
+
+
+def format_size(num_bytes: int) -> str:
+    """把字节数格式化成便于阅读的字符串"""
+    size = float(num_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024 or unit == "GB":
+            return f"{size:.0f} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} GB"
+
+
+def print_summary(
+    files: Sequence[Tuple[Path, Path]],
+    collect_stats: CollectStats,
+    write_stats: WriteStats,
+    blank_lines: int
+) -> None:
+    """输出统计信息，便于确认排除规则是否按预期生效"""
+    print(
+        f"共扫描 {collect_stats.scanned_files} 个文件，"
+        f"收集 {len(files)} 个，占用 {format_size(write_stats.output_bytes)}。"
+    )
+
+    details: Dict[str, int] = {
+        "按 exclude_files 排除文件": collect_stats.excluded_by_config,
+        "按 exclude_files 跳过目录": collect_stats.pruned_dirs_by_config,
+        "按 .gitignore 排除文件": collect_stats.excluded_by_gitignore,
+        "按 .gitignore 跳过目录": collect_stats.pruned_dirs_by_gitignore,
+        "跳过符号链接": collect_stats.skipped_symlinks,
+        "跳过非普通文件": collect_stats.skipped_not_regular,
+        "跳过二进制文件": write_stats.binary_files,
+        "读取失败": write_stats.read_errors,
+    }
+    for label, count in details.items():
+        if count:
+            print(f"  - {label}: {count}")
+
+    if collect_stats.gitignore_files:
+        print(f"  - 加载 .gitignore: {collect_stats.gitignore_files} 个")
+    print(f"  - 文件之间空行数: {blank_lines}")
 
 
 def main() -> int:
@@ -646,7 +682,7 @@ def main() -> int:
 
     # 3. 递归收集文件列表（输出文件自身始终排除）
     print("正在收集文件列表...")
-    files = collect_files(
+    files, collect_stats = collect_files(
         target_dir,
         config.exclude_patterns,
         config.use_gitignore,
@@ -661,9 +697,9 @@ def main() -> int:
     # 4. 写入内容
     print("正在写入文件内容（可能需要一段时间）...")
     write_stats = write_output(output_file, files, config.newlines_between_files)
-    if write_stats.binary_files > 0:
-        print(f"已跳过 {write_stats.binary_files} 个二进制文件")
 
+    # 5. 统计
+    print_summary(files, collect_stats, write_stats, config.newlines_between_files)
     print("完成！")
     return 0
 
